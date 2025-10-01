@@ -187,20 +187,25 @@ export async function generateWithExternalModel(prompt) {
 export async function answer(query) {
   await ingestAllPdfs();
 
-  const hits = await retrieve(query, 12);
+  const q = String(query || "").trim();
+  const wordCount = q.split(/\s+/).filter(Boolean).length;
+  const shortGreeting = /^(hi|hello|hey|yo|hiya|sup|good (morning|afternoon|evening))\b/i.test(q) && wordCount <= 3;
 
-  // If no matches, still answer via LLM
-  if (!hits.length) {
-    const prompt = `User: ${query}\nAnswer naturally.`;
-    const text = await generateWithExternalModel(prompt);
+  const hits = await retrieve(q, 12);
+  const best = hits[0]?.score ?? 0;
+
+  // Only bypass if it's a *short* greeting. Otherwise try RAG.
+  if (shortGreeting || best < 0.2) {
+    const text = await generateWithExternalModel(`User: ${q}\nAnswer naturally.`);
     return { answer: text, citations: [] };
   }
 
   const context = hits.map(h => `[${h.doc}#chunk${h.chunk_id}]\n${h.text}`).join("\n\n");
+
   const prompt =
-    "Answer only from the context. If information is missing, say you do not know.\n" +
-    "Cite doc#chunk ids.\n\n" +
-    `Question: ${query}\n\n---CONTEXT START---\n${context}\n---CONTEXT END---\n\nAnswer:`;
+    "You are a retrieval-grounded assistant. Use ONLY the provided context. If the answer is not in the context, say you do not know.\n" +
+    "Always include citations as doc#chunk ids found in the context.\n\n" +
+    `Question: ${q}\n\n---CONTEXT START---\n${context}\n---CONTEXT END---\n\nAnswer:`;
 
   const text = await generateWithExternalModel(prompt);
   const citations = hits.slice(0, 4).map(h => `${h.doc}#chunk${h.chunk_id}`);
