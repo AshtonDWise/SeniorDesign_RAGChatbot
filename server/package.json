@@ -1,0 +1,18 @@
+{
+  "name": "pdf-rag-server",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@xenova/transformers": "2.17.2",
+    "cors": "2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "langchain": "^0.3.35",
+    "multer": "1.4.5-lts.1",
+    "node-fetch": "3.3.2",
+    "pdf-parse": "^1.1.1",
+    "vectra": "^0.11.1"
+  }
+}
