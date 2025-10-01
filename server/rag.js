@@ -1,132 +1,208 @@
 import fs from "fs";
 import path from "path";
-import pdfParse from "pdf-parse";
-import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
-import { VectorStoreIndex } from "vectra";
 import fetch from "node-fetch";
+import { fileURLToPath } from "url";
 
-// initialize local vector index
-const dataDir = path.join(process.cwd(), "data");
-const indexFile = path.join(process.cwd(), "vector.index.json");
-let index = new VectorStoreIndex();
+// ---------- paths ----------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+export const DATA_DIR = path.join(__dirname, "data");
+const INDEX_DIR = path.join(__dirname, "index");
+const META_PATH = path.join(INDEX_DIR, "meta.json");
+const EMB_PATH = path.join(INDEX_DIR, "embeddings.bin");
+const SHAPE_PATH = path.join(INDEX_DIR, "shape.json");
 
-// ------------------- PDF INGEST -------------------
+// ---------- PDF -> text via pdfjs-dist ----------
+async function pdfToText(filePath) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // Do NOT set GlobalWorkerOptions.workerSrc here.
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const doc = await pdfjs.getDocument({
+    data,
+    disableWorker: true,          // <<< key fix for Node
+    useWorkerFetch: false,
+    isEvalSupported: false
+  }).promise;
+
+  const out = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    const tc = await page.getTextContent();
+    out.push(tc.items.map(it => it.str).join(" "));
+  }
+  try { await doc.destroy(); } catch {}
+  return out.join("\n");
+}
+
+// ---------- embeddings via @xenova/transformers ----------
+let embedder = null;
+async function getEmbedder() {
+  if (!embedder) {
+    const { pipeline } = await import("@xenova/transformers");
+    const model = process.env.EMB_MODEL || "Xenova/bge-base-en-v1.5"; // stronger than -small
+    embedder = await pipeline("feature-extraction", model, { quantized: true });
+  }
+  return embedder;
+}
+
+async function embed(texts) {
+  const e = await getEmbedder();
+  const out = await e(texts, { pooling: "mean", normalize: true });
+  const flat = Array.isArray(out.data) ? Float32Array.from(out.data) : out.data; // Float32Array
+  const dim = flat.length / texts.length;
+  const arrs = [];
+  for (let i = 0; i < texts.length; i++) arrs.push(flat.slice(i * dim, (i + 1) * dim));
+  return { vectors: arrs, dim };
+}
+
+function cosine(a, b) {
+  let s = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { s += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return s / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
+}
+
+function chunkText(text, size = 1200, overlap = 150) {
+  const out = [];
+  for (let i = 0; i < text.length; i += size - overlap) {
+    const c = text.slice(i, i + size).trim();
+    if (c) out.push(c);
+  }
+  return out;
+}
+
+// ---------- in-process persistent index ----------
+let META = [];   // [{doc, path, chunk_id, text}]
+let EMB = null;  // Float32Array length META.length * D
+let D = 0;
+
+function loadIndexIfExists() {
+  try {
+    if (!fs.existsSync(META_PATH) || !fs.existsSync(EMB_PATH) || !fs.existsSync(SHAPE_PATH)) return false;
+    META = JSON.parse(fs.readFileSync(META_PATH, "utf-8"));
+    const { n, d } = JSON.parse(fs.readFileSync(SHAPE_PATH, "utf-8"));
+    const buf = fs.readFileSync(EMB_PATH);
+    EMB = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+    D = d;
+    return META.length === n && EMB.length === n * d;
+  } catch {
+    return false;
+  }
+}
+
+function saveIndex() {
+  fs.mkdirSync(INDEX_DIR, { recursive: true });
+  fs.writeFileSync(META_PATH, JSON.stringify(META));
+  fs.writeFileSync(EMB_PATH, Buffer.from(EMB.buffer));
+  fs.writeFileSync(SHAPE_PATH, JSON.stringify({ n: META.length, d: D }));
+}
+
+export function getIndexStats() {
+  return { docs: new Set(META.map(m => m.doc)).size, chunks: META.length, dim: D };
+}
+
+// ---------- ingest PDFs ----------
 export async function ingestAllPdfs() {
-  console.log("Ingesting PDFs from", dataDir);
-  const files = fs.readdirSync(dataDir).filter(f => f.toLowerCase().endsWith(".pdf"));
-  const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 150 });
+  if (loadIndexIfExists()) return;
 
-  for (const file of files) {
-    const fullPath = path.join(dataDir, file);
-    const buf = fs.readFileSync(fullPath);
-    const data = await pdfParse(buf);
-    const chunks = await splitter.splitText(data.text);
-    for (const text of chunks) {
-      index.addDocument({ text, meta: { source: file } });
-    }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const pdfs = fs.readdirSync(DATA_DIR).filter(f => f.toLowerCase().endsWith(".pdf"));
+  const rows = [];
+  for (const f of pdfs) {
+    const p = path.join(DATA_DIR, f);
+    const text = await pdfToText(p);
+    console.log(`[ingest] ${f} chars=${text.length}`);
+    const chunks = chunkText(text || "");
+    console.log(`[ingest] ${f} chunks=${chunks.length}`);
+    chunks.forEach((t, ci) => rows.push({ doc: f, path: p, chunk_id: ci, text: t }));
+  }
+  console.log(`[ingest] total docs=${pdfs.length}, total chunks=${rows.length}`);
+
+  if (rows.length === 0) {
+    META = [];
+    EMB = new Float32Array(0);
+    D = 0;
+    saveIndex();
+    return;
   }
 
-  console.log(`Indexed ${index.documents.length} text chunks from ${files.length} PDFs`);
-  fs.writeFileSync(indexFile, JSON.stringify(index));
-  return true;
+  const { vectors, dim } = await embed(rows.map(r => r.text));
+  D = dim;
+  META = rows;
+  EMB = new Float32Array(vectors.length * D);
+  for (let i = 0; i < vectors.length; i++) EMB.set(vectors[i], i * D);
+  saveIndex();
 }
 
-// ------------------- QUERY HANDLER -------------------
-export async function answer(query) {
-  if (!index.documents.length && fs.existsSync(indexFile)) {
-    index = VectorStoreIndex.fromJSON(JSON.parse(fs.readFileSync(indexFile, "utf8")));
+function ensureIndexLoaded() {
+  if (META.length && EMB && D) return true;
+  return loadIndexIfExists();
+}
+
+export async function retrieve(query, k = 12) {
+  if (!ensureIndexLoaded()) return [];
+  const { vectors } = await embed([query]);
+  const q = vectors[0];
+  const scored = [];
+  for (let i = 0; i < META.length; i++) {
+    const v = EMB.subarray(i * D, (i + 1) * D);
+    scored.push({ i, score: cosine(q, v) });
   }
-
-  if (!index.documents.length) return { answer: "No data indexed.", citations: [] };
-
-  const matches = index.similaritySearch(query, 4);
-  const context = matches.map(m => m.text).join("\n\n");
-  const citations = matches.map(m => m.meta.source);
-
-  const prompt = `
-You are a document retrieval assistant. Use only the context below to answer the question.
-
-Context:
-${context}
-
-Question: ${query}
-`;
-
-  const answerText = await generateWithExternalModel(prompt);
-  return { answer: answerText, citations };
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, k).map(s => ({ ...META[s.i], score: s.score }));
 }
 
-// ------------------- GENERATION HANDLER -------------------
+// ---------- generation via OpenAI-compatible HF endpoint ----------
 export async function generateWithExternalModel(prompt) {
-  const hfUrl = process.env.HF_URL;
-  const hfToken = process.env.HF_TOKEN;
-  const llamaUrl = process.env.LLAMA_URL;
-  const ollamaUrl = process.env.OLLAMA_URL;
-  const ollamaModel = process.env.OLLAMA_MODEL || "lfm2-1-2b-rag";
+  const base = process.env.HF_URL;   // e.g. https://...huggingface.cloud
+  const token = process.env.HF_TOKEN;
+  const model = process.env.HF_MODEL || "LiquidAI/LFM2-1.2B-RAG-GGUF";
+  if (!base || !token) return "No generator configured";
 
-  // helper for readable errors
-  const parseOut = raw => {
-    try {
-      const js = JSON.parse(raw);
-      if (Array.isArray(js) && js[0]?.generated_text) return js[0].generated_text;
-      if (typeof js.generated_text === "string") return js.generated_text;
-      if (typeof js.outputs === "string") return js.outputs;
-      if (Array.isArray(js.outputs) && typeof js.outputs[0] === "string") return js.outputs[0];
-      if (typeof js.output_text === "string") return js.output_text;
-      if (typeof js.error === "string") return `Generator error: ${js.error}`;
-      return JSON.stringify(js);
-    } catch {
-      return raw;
-    }
+  const url = base.replace(/\/+$/, "") + "/v1/chat/completions";
+  const headers = { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" };
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: "Use only the provided context if present. If information is missing, say you do not know." },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.2,
+    max_tokens: 512
   };
 
-  // ---- Hugging Face ----
-  if (hfUrl && hfToken) {
-    const body = {
-      inputs: prompt,
-      parameters: {
-        max_new_tokens: 512,
-        temperature: 0.2,
-        top_p: 0.95,
-        return_full_text: false
-      }
-    };
+  const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const raw = await r.text();
+  if (!r.ok) return `Generator error ${r.status}: ${raw}`;
 
-    const r = await fetch(hfUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${hfToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+  try {
+    const js = JSON.parse(raw);
+    const content = js?.choices?.[0]?.message?.content;
+    return typeof content === "string" ? content : raw;
+  } catch {
+    return raw;
+  }
+}
 
-    const raw = await r.text();
-    if (!r.ok) return `Generator error ${r.status}: ${parseOut(raw)}`;
-    return parseOut(raw);
+// ---------- RAG answer ----------
+export async function answer(query) {
+  await ingestAllPdfs();
+
+  const hits = await retrieve(query, 12);
+
+  // If no matches, still answer via LLM
+  if (!hits.length) {
+    const prompt = `User: ${query}\nAnswer naturally.`;
+    const text = await generateWithExternalModel(prompt);
+    return { answer: text, citations: [] };
   }
 
-  // ---- llama.cpp ----
-  if (llamaUrl) {
-    const r = await fetch(llamaUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, n_predict: 512, temperature: 0.2 })
-    });
-    const raw = await r.text();
-    try { return JSON.parse(raw).content || raw; } catch { return raw; }
-  }
+  const context = hits.map(h => `[${h.doc}#chunk${h.chunk_id}]\n${h.text}`).join("\n\n");
+  const prompt =
+    "Answer only from the context. If information is missing, say you do not know.\n" +
+    "Cite doc#chunk ids.\n\n" +
+    `Question: ${query}\n\n---CONTEXT START---\n${context}\n---CONTEXT END---\n\nAnswer:`;
 
-  // ---- Ollama ----
-  if (ollamaUrl) {
-    const r = await fetch(ollamaUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: ollamaModel, prompt, options: { temperature: 0.2 } })
-    });
-    const raw = await r.text();
-    try { return JSON.parse(raw).response || raw; } catch { return raw; }
-  }
-
-  return "No generator configured";
+  const text = await generateWithExternalModel(prompt);
+  const citations = hits.slice(0, 4).map(h => `${h.doc}#chunk${h.chunk_id}`);
+  return { answer: text, citations };
 }

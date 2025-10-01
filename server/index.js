@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { answer, ingestAllPdfs } from "./rag.js";
+import { answer, ingestAllPdfs, getIndexStats, retrieve } from "./rag.js";
 
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGINS?.split(",") || "*" }));
@@ -20,9 +20,20 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+// optional debug endpoints
+app.get("/debug/index", async (_req, res) => {
+  await ingestAllPdfs();
+  res.json(getIndexStats());
+});
+app.post("/debug/retrieve", async (req, res) => {
+  const q = String(req.body?.q || "");
+  const hits = await retrieve(q, 8);
+  res.json(hits.map(h => ({ doc: h.doc, chunk: h.chunk_id, score: Number(h.score.toFixed(4)), preview: h.text.slice(0, 200) })));
+});
+
 const PORT = Number(process.env.PORT || 8000);
 
-// warm the index at boot so data/ PDFs are ready
+// build or load index on boot
 await ingestAllPdfs();
 
 app.listen(PORT, () => console.log(`server on ${PORT}`));
